@@ -60,7 +60,7 @@ GateSensor gateSensors[] = {
   {SENSOR_RA_1_PIN,  "SENSOR_RA_1",  "exit_approach",  "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
   {SENSOR_RA_2_PIN,  "SENSOR_RA_2",  "exit_passed",    "vehicle_passed",    false, false, 0, LOW,  true, &servoExit, 90, "exit"}  // Tự động đóng rào ra (vị trí 90), active LOW
 };
-const int NUM_GATE_SENSORS = sizeof(gateSensors) / sizeof(GateSensor);
+const int NUM_GATE_SENSORS = 4;
 const unsigned long GATE_SENSOR_DEBOUNCE_INTERVAL = 500; // Thời gian debounce cho cảm biến cổng (ms)
 
 
@@ -79,7 +79,7 @@ ParkingSlotSensor parkingSlots[] = {
   // {SLOT_SENSOR_PIN_3, "S3", false, false, 0},
   // {SLOT_SENSOR_PIN_4, "S4", false, false, 0}
 };
-const int NUM_PARKING_SLOTS = sizeof(parkingSlots) / sizeof(ParkingSlotSensor);
+const int NUM_PARKING_SLOTS = 2;
 const unsigned long SLOT_DEBOUNCE_DELAY = 1000;
 
 
