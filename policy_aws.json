@@ -1,0 +1,30 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": "iot:Connect",
+        "Resource": "arn:aws:iot:YOUR_AWS_REGION:180294202722:client/*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "iot:Publish",
+        "Resource": [
+          "arn:aws:iot:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:topic/parking/sensor/+/status",
+          "arn:aws:iot:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:topic/parking/barrier/+/state"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": "iot:Subscribe",
+        "Resource": [
+          "arn:aws:iot:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:topicfilter/parking/barrier/+/command"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": "iot:Receive",
+        "Resource": "*"
+      }
+    ]
+  }
