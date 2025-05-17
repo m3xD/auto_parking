@@ -1,70 +1,79 @@
-// Bao gồm các thư viện cần thiết
 #include "secrets.h" // File chứa thông tin bí mật (WiFi, AWS credentials, certificates)
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <ESP32Servo.h> // Thư viện Servo cho ESP32
-#include <time.h>       // Thư viện thời gian cho NTP
+#include <ESP32Servo.h>
+#include <time.h>
+#include <esp_task_wdt.h>  // Watchdog Timer
+#include <Preferences.h>   // Lưu trữ không bay hơi
 
-// --- ĐỊNH NGHĨA PIN CHO CẢM BIẾN VÀ SERVO ---
+// ======= ĐỊNH NGHĨA PIN CHO CẢM BIẾN VÀ SERVO ========
 // Cảm biến cổng
 #define SENSOR_VAO_1_PIN 26
-#define SENSOR_VAO_2_PIN 34 
+#define SENSOR_VAO_2_PIN 34
 #define SENSOR_RA_1_PIN  13
-#define SENSOR_RA_2_PIN  23 
+#define SENSOR_RA_2_PIN  23
 
 // Servo điều khiển rào chắn
-#define SERVO_ENTRY_PIN 19 // Servo cho rào vào
-#define SERVO_EXIT_PIN  18 // Servo cho rào ra
+#define SERVO_ENTRY_PIN 19
+#define SERVO_EXIT_PIN  18
 
-// Cảm biến chỗ đỗ 
-#define SLOT_SENSOR_PIN_1 16 
-#define SLOT_SENSOR_PIN_2 4
-// #define SLOT_SENSOR_PIN_3 25
-// #define SLOT_SENSOR_PIN_4 27 
+// Cảm biến chỗ đỗ (4 cảm biến IR)
+#define SLOT_SENSOR_PIN_1 32
+#define SLOT_SENSOR_PIN_2 33
+#define SLOT_SENSOR_PIN_3 25
+#define SLOT_SENSOR_PIN_4 27
 
-// Khai báo đối tượng Servo
+// ======= HẰNG SỐ VÀ CẤU HÌNH ========
+// Cấu hình Watchdog
+#define WDT_TIMEOUT 10  // 10 giây timeout cho watchdog
+
+// Cấu hình đo lường thời gian và debounce
+#define GATE_SENSOR_DEBOUNCE_INTERVAL 500   // ms
+#define SLOT_DEBOUNCE_DELAY 1000            // ms
+#define STATUS_REPORT_INTERVAL 60000        // 1 phút
+#define STATE_SAVE_INTERVAL 300000          // 5 phút
+#define RECONNECT_INTERVAL 5000             // 5 giây
+#define MAX_RECONNECT_ATTEMPTS 5            // Số lần thử kết nối tối đa
+#define ACTIVITY_TIMEOUT 1800000            // 30 phút trước khi chuyển sang chế độ tiết kiệm năng lượng
+
+// Cấu hình MQTT
+#define MAX_MQTT_QUEUE 10                   // Số lượng thông điệp MQTT tối đa trong hàng đợi
+#define MAX_MQTT_PAYLOAD_SIZE 512           // Kích thước tối đa của payload MQTT
+
+// Cấu hình NTP
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 7 * 3600             // UTC+7 
+#define DAYLIGHT_OFFSET_SEC 0
+
+// ======= KHAI BÁO ĐỐI TƯỢNG TOÀN CỤC ========
+// Khởi tạo đối tượng Servo
 Servo servoEntry, servoExit;
 
-// --- KHỞI TẠO BIẾN TOÀN CỤC CHO WIFI VÀ MQTT ---
-WiFiClientSecure net = WiFiClientSecure(); // Đối tượng client an toàn cho WiFi
-PubSubClient client(net);                  // Đối tượng client MQTT
+// Khởi tạo đối tượng WiFi, MQTT và lưu trữ
+WiFiClientSecure net = WiFiClientSecure();
+PubSubClient client(net);
+Preferences preferences;
 
-// Cấu hình NTP (Network Time Protocol) để đồng bộ thời gian
-const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 7 * 3600; // Việt Nam GMT+7
-const int DAYLIGHT_OFFSET_SEC = 0;    // Không sử dụng DST
-
-// --- CẤU TRÚC VÀ BIẾN QUẢN LÝ CẢM BIẾN ---
-
+// ======= CÁC CẤU TRÚC DỮ LIỆU ========
 // Cấu trúc quản lý cảm biến cổng
 struct GateSensor {
   const int pin;
-  const char* sensorIdentifier;   // ID định danh cảm biến, ví dụ: "SENSOR_VAO_1"
-  const char* gateAreaMqttId;     // Phần ID cho topic MQTT, ví dụ: "entry_approach"
-  const char* eventTypeOnActive;  // Sự kiện publish khi active, ví dụ: "presence_detected" hoặc "vehicle_passed"
-  bool isActive;                  // Trạng thái logic hiện tại của cảm biến (true = active)
-  bool prevIsActive;              // Trạng thái logic đã publish trước đó
-  unsigned long lastDebounceTime; // Thời gian cuối cùng phát hiện thay đổi (cho debounce)
+  const char* sensorIdentifier;
+  const char* gateAreaMqttId;
+  const char* eventTypeOnActive;
+  bool isActive;
+  bool prevIsActive;
+  unsigned long lastDebounceTime;
   const int activeLogicLevel;     // Mức logic được coi là active (HIGH hoặc LOW)
-  bool autoCloseBarrier;          // Cờ xác định cảm biến này có tự động đóng rào không
-  Servo* associatedServo;         // Servo liên quan (nếu có autoCloseBarrier)
-  int servoClosePosition;         // Vị trí đóng của servo liên quan
-  const char* barrierTypeForState; // "entry" hoặc "exit" để publish state
+  bool autoCloseBarrier;
+  Servo* associatedServo;
+  int servoClosePosition;
+  const char* barrierTypeForState;
 };
 
-GateSensor gateSensors[] = {
-  {SENSOR_VAO_1_PIN, "SENSOR_VAO_1", "entry_approach", "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
-  {SENSOR_VAO_2_PIN, "SENSOR_VAO_2", "entry_passed",   "vehicle_passed",    false, false, 0, HIGH, true, &servoEntry, 0, "entry"}, // Tự động đóng rào vào (vị trí 0)
-  {SENSOR_RA_1_PIN,  "SENSOR_RA_1",  "exit_approach",  "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
-  {SENSOR_RA_2_PIN,  "SENSOR_RA_2",  "exit_passed",    "vehicle_passed",    false, false, 0, LOW,  true, &servoExit, 90, "exit"}  // Tự động đóng rào ra (vị trí 90), active LOW
-};
-const int NUM_GATE_SENSORS = 4;
-const unsigned long GATE_SENSOR_DEBOUNCE_INTERVAL = 500; // Thời gian debounce cho cảm biến cổng (ms)
-
-
-// Cấu trúc quản lý cảm biến chỗ đỗ (giữ nguyên như trước)
+// Cấu trúc quản lý cảm biến chỗ đỗ
 struct ParkingSlotSensor {
   const int pin;
   const char* slotMqttId;
@@ -74,316 +83,797 @@ struct ParkingSlotSensor {
   const int activeLogicLevel;
 };
 
-ParkingSlotSensor parkingSlots[] = {
-  {SLOT_SENSOR_PIN_1, "S1", false, false, 0, HIGH}, // Giả sử active HIGH = occupied
-  {SLOT_SENSOR_PIN_2, "S2", false, false, 0, HIGH},
-//   {SLOT_SENSOR_PIN_3, "S3", false, false, 0, HIGH},
-//   {SLOT_SENSOR_PIN_4, "S4", false, false, 0, HIGH}
+// Cấu trúc cho hàng đợi MQTT
+struct MQTTMessage {
+  char topic[50];
+  char payload[MAX_MQTT_PAYLOAD_SIZE];
+  size_t length;
+  bool retained;
+  int qos;
+  bool pending;
 };
-const int NUM_PARKING_SLOTS = 2;
-const unsigned long SLOT_DEBOUNCE_DELAY = 1000;
 
+// ======= KHỞI TẠO CẢM BIẾN ========
+// Cảm biến cổng với activeLogicLevel phù hợp
+GateSensor gateSensors[] = {
+  // {pin, identifier, gateArea, eventType, isActive, prevIsActive, lastDebounce, activeLogic, autoClose, servo, servoPos, barrierType}
+  {SENSOR_VAO_1_PIN, "SENSOR_VAO_1", "entry_approach", "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
+  {SENSOR_VAO_2_PIN, "SENSOR_VAO_2", "entry_passed",   "vehicle_passed",    false, false, 0, HIGH, true, &servoEntry, 0, "entry"},
+  {SENSOR_RA_1_PIN,  "SENSOR_RA_1",  "exit_approach",  "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
+  {SENSOR_RA_2_PIN,  "SENSOR_RA_2",  "exit_passed",    "vehicle_passed",    false, false, 0, LOW,  true, &servoExit, 90, "exit"}
+};
+const int NUM_GATE_SENSORS = sizeof(gateSensors) / sizeof(GateSensor);
 
-// --- CÁC HÀM TIỆN ÍCH (connectWiFi, syncNTPTime, publishMqttMessage, publishBarrierState, publishGateSensorEvent, publishParkingSlotStatus, messageHandler, connectAWSIoT) ---
-// Giữ nguyên các hàm này như trong phiên bản "esp32_parking_controller_final"
-// Lưu ý: publishGateSensorEvent sẽ được gọi từ hàm xử lý cảm biến cổng mới.
+// Cảm biến chỗ đỗ
+ParkingSlotSensor parkingSlots[] = {
+  // {pin, slotId, isOccupied, prevIsOccupied, lastDebounce, activeLogic}
+  {SLOT_SENSOR_PIN_1, "S1", false, false, 0, HIGH},
+  {SLOT_SENSOR_PIN_2, "S2", false, false, 0, HIGH},
+  {SLOT_SENSOR_PIN_3, "S3", false, false, 0, HIGH},
+  {SLOT_SENSOR_PIN_4, "S4", false, false, 0, HIGH}
+};
+const int NUM_PARKING_SLOTS = sizeof(parkingSlots) / sizeof(ParkingSlotSensor);
 
+// ======= BIẾN TOÀN CỤC ========
+// Biến cho hàng đợi MQTT
+MQTTMessage mqttQueue[MAX_MQTT_QUEUE];
+int mqttQueueIndex = 0;
+
+// Biến cho quản lý kết nối
+unsigned long lastReconnectAttempt = 0;
+int reconnectCount = 0;
+String deviceMacAddress = "";
+
+// Biến cho quản lý năng lượng
+unsigned long lastActivityTime = 0;
+bool lowPowerMode = false;
+
+// Biến cho báo cáo trạng thái
+unsigned long lastStatusReport = 0;
+unsigned long lastStateSave = 0;
+String firmwareVersion = "1.0.0";  // Phiên bản firmware
+
+// Biến toàn cục theo dõi trạng thái
+int totalOccupiedSlots = 0;
+bool entryGateOpen = false;
+bool exitGateOpen = false;
+unsigned long systemStartTime = 0;
+
+// ======= KHAI BÁO HÀM ========
+// Các hàm kết nối và giao tiếp
+void connectWiFi();
+void syncNTPTime();
+boolean reconnectAWSIoT();
+void connectAWSIoT();
+String getTimeStamp();
+
+// Các hàm xử lý MQTT
+void messageHandler(char* topic, byte* payload, unsigned int length);
+bool queueMqttMessage(const char* topic, const char* payload, size_t length, int qos = 0, bool retained = false);
+bool publishMqttMessage(const char* topic, const JsonDocument& doc, int qos = 0, bool retained = false);
+void processQueuedMessages();
+
+// Các hàm xuất bản trạng thái
+void publishBarrierState(const char* barrierType, const char* state);
+void publishGateSensorEvent(const char* sensorPinIdentifier, const char* gateArea, const char* eventType);
+void publishParkingSlotStatus(const char* slotMqttId, bool isOccupied);
+void publishInitialState();
+void reportSystemStatus();
+
+// Các hàm xử lý cảm biến
+void handleGateSensors();
+void handleParkingSlotSensors();
+
+// Các hàm lưu trữ trạng thái
+void saveState();
+void restoreState();
+
+// ======= TRIỂN KHAI CÁC HÀM ========
+
+// ---- HÀM KẾT NỐI VÀ GIAO TIẾP ----
+
+// Kết nối WiFi
 void connectWiFi() {
-  Serial.print("Đang kết nối WiFi: ");
-  Serial.println(SECRET_WIFI_SSID);
-  WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  Serial.print("Đang kết nối WiFi đến ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  unsigned long startAttemptTime = millis();
+  
+  while (WiFi.status() != WL_CONNECTED && 
+         millis() - startAttemptTime < 10000) {
     Serial.print(".");
+    delay(100);
   }
-  Serial.println("\nĐã kết nối WiFi!");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nKhông thể kết nối WiFi. Đang khởi động lại...");
+    ESP.restart();
+  }
+  
+  Serial.println("\nĐã kết nối WiFi");
   Serial.print("Địa chỉ IP: ");
   Serial.println(WiFi.localIP());
+  
+  deviceMacAddress = WiFi.macAddress();
+  Serial.print("Địa chỉ MAC: ");
+  Serial.println(deviceMacAddress);
+  
+  // Đồng bộ thời gian sau khi kết nối WiFi
+  syncNTPTime();
 }
 
+// Đồng bộ thời gian từ server NTP
 void syncNTPTime() {
-  Serial.print("Đang cài đặt thời gian qua NTP server: ");
-  Serial.println(NTP_SERVER);
+  Serial.println("Đang đồng bộ thời gian với NTP server...");
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Không thể lấy thời gian từ NTP server. Đang thử lại...");
+  int retry = 0;
+  while (!getLocalTime(&timeinfo) && retry < 5) {
+    Serial.println("Đang chờ đồng bộ thời gian...");
     delay(1000);
-    return; 
+    retry++;
   }
-  Serial.println("Đồng bộ thời gian thành công.");
-  Serial.println(&timeinfo, "Thời gian hiện tại: %A, %B %d %Y %H:%M:%S");
-}
-
-void publishMqttMessage(const char* topic, const JsonDocument& doc) {
-  if (!client.connected()) {
-    Serial.println("MQTT chưa kết nối. Bỏ qua publish.");
+  
+  if (retry >= 5) {
+    Serial.println("Không thể đồng bộ thời gian. Tiếp tục...");
     return;
   }
-  char jsonBuffer[256];
-  size_t n = serializeJson(doc, jsonBuffer);
-  Serial.print("Đang publish tới topic: "); Serial.println(topic);
-  Serial.print("Payload: "); Serial.println(jsonBuffer);
-  if (client.publish(topic, jsonBuffer, n)) {
-    Serial.println("Publish OK");
-  } else {
-    Serial.println("Publish THẤT BẠI");
-  }
+  
+  Serial.print("Thời gian hiện tại: ");
+  Serial.println(getTimeStamp());
 }
 
-void publishBarrierState(const char* barrierType, const char* state) {
-  StaticJsonDocument<128> doc;
-  doc["thing_id"] = SECRET_AWS_THING_NAME;
-  doc["barrier_id"] = (strcmp(barrierType, "entry") == 0) ? "entry_barrier_1" : "exit_barrier_1";
-  doc["state"] = state;
-  char timeBuffer[30];
+// Lấy timestamp hiện tại từ NTP
+String getTimeStamp() {
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    doc["timestamp"] = timeBuffer;
+  if (!getLocalTime(&timeinfo)) {
+    return "Unknown";
   }
-  char topicBuffer[128];
-  sprintf(topicBuffer, "parking/barrier/%s/%s/state", SECRET_AWS_THING_NAME, barrierType);
-  publishMqttMessage(topicBuffer, doc);
+  char timeStringBuff[50];
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(timeStringBuff);
 }
 
-void publishGateSensorEvent(const char* sensorPinIdentifier, const char* gateArea, const char* eventType) {
-  StaticJsonDocument<128> doc;
-  doc["thing_id"] = SECRET_AWS_THING_NAME;
-  doc["sensor_id"] = sensorPinIdentifier;
-  doc["event"] = eventType;
-  doc["gate_area"] = gateArea;
-  char timeBuffer[30];
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    doc["timestamp"] = timeBuffer;
+// Thử kết nối lại AWS IoT
+boolean reconnectAWSIoT() {
+  Serial.println("Đang thử kết nối lại đến AWS IoT Core...");
+  
+  String clientId = "ESP32_" + deviceMacAddress;
+  
+  if (client.connect(clientId.c_str())) {
+    Serial.println("Đã kết nối lại thành công đến AWS IoT!");
+    reconnectCount = 0;
+    
+    // Đăng ký lại các topic cần thiết
+    client.subscribe("$aws/things/" THINGNAME "/shadow/update/accepted");
+    client.subscribe("$aws/things/" THINGNAME "/shadow/get/accepted");
+    client.subscribe("smart_parking/command/barriers/#");
+    
+    // Báo cáo trạng thái kết nối
+    DynamicJsonDocument statusDoc(256);
+    statusDoc["state"]["reported"]["connection"] = "online";
+    statusDoc["state"]["reported"]["last_reconnect"] = getTimeStamp();
+    statusDoc["state"]["reported"]["ip"] = WiFi.localIP().toString();
+    statusDoc["state"]["reported"]["rssi"] = WiFi.RSSI();
+    
+    char buffer[256];
+    size_t n = serializeJson(statusDoc, buffer);
+    client.publish("$aws/things/" THINGNAME "/shadow/update", buffer, n);
+    
+    return true;
   }
-  char topicBuffer[128];
-  sprintf(topicBuffer, "parking/sensor/%s/%s/event", SECRET_AWS_THING_NAME, gateArea);
-  publishMqttMessage(topicBuffer, doc);
+  
+  return false;
 }
 
-void publishParkingSlotStatus(const char* slotMqttId, bool isOccupied) {
-  StaticJsonDocument<128> doc;
-  doc["thing_id"] = SECRET_AWS_THING_NAME;
-  doc["slot_id"] = slotMqttId;
-  doc["status"] = isOccupied ? "occupied" : "vacant";
-  char timeBuffer[30];
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    doc["timestamp"] = timeBuffer;
-  }
-  char topicBuffer[128];
-  sprintf(topicBuffer, "parking/slot/%s/%s/status", SECRET_AWS_THING_NAME, slotMqttId);
-  publishMqttMessage(topicBuffer, doc);
-}
-
-void messageHandler(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Tin nhắn đến từ topic: ["); Serial.print(topic); Serial.print("], Payload: ");
-  String messageTemp;
-  for (int i = 0; i < length; i++) { messageTemp += (char)payload[i]; }
-  Serial.println(messageTemp);
-
-  StaticJsonDocument<128> doc;
-  DeserializationError error = deserializeJson(doc, payload, length);
-  if (error) { Serial.print(F("Lỗi deserializeJson(): ")); Serial.println(error.f_str()); return; }
-
-  const char* receivedCommand = doc["command"];
-  char entryBarrierCommandTopic[128]; char exitBarrierCommandTopic[128];
-  sprintf(entryBarrierCommandTopic, "parking/barrier/%s/entry/command", SECRET_AWS_THING_NAME);
-  sprintf(exitBarrierCommandTopic, "parking/barrier/%s/exit/command", SECRET_AWS_THING_NAME);
-
-  if (strcmp(topic, entryBarrierCommandTopic) == 0) {
-    if (strcmp(receivedCommand, "open") == 0) {
-      servoEntry.write(90); Serial.println("Servo Rào Vào: MỞ (Lệnh từ server)");
-      publishBarrierState("entry", "opened_command");
-    } else if (strcmp(receivedCommand, "close") == 0) {
-      servoEntry.write(0); Serial.println("Servo Rào Vào: ĐÓNG (Lệnh từ server)");
-      publishBarrierState("entry", "closed_command");
-    }
-  } else if (strcmp(topic, exitBarrierCommandTopic) == 0) {
-    if (strcmp(receivedCommand, "open") == 0) {
-      servoExit.write(0); Serial.println("Servo Rào Ra: MỞ (Lệnh từ server)");
-      publishBarrierState("exit", "opened_command");
-    } else if (strcmp(receivedCommand, "close") == 0) {
-      servoExit.write(90); Serial.println("Servo Rào Ra: ĐÓNG (Lệnh từ server)");
-      publishBarrierState("exit", "closed_command");
-    }
-  }
-}
-
+// Kết nối đến AWS IoT
 void connectAWSIoT() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo) || timeinfo.tm_year < (2023 - 1900)) {
-    Serial.println("Thời gian chưa được đồng bộ. Đang đồng bộ..."); syncNTPTime();
-    if (!getLocalTime(&timeinfo) || timeinfo.tm_year < (2023 - 1900)) {
-        Serial.println("Không thể đồng bộ thời gian sau khi thử lại. Kết nối MQTT có thể thất bại.");
+  // Cấu hình các thông số cho kết nối an toàn
+  net.setCACert(AWS_CERT_CA);
+  net.setCertificate(AWS_CERT_CRT);
+  net.setPrivateKey(AWS_CERT_PRIVATE);
+  
+  // Cấu hình client MQTT
+  client.setServer(AWS_IOT_ENDPOINT, 8883);
+  client.setCallback(messageHandler);
+  client.setKeepAlive(60); // Cấu hình keep-alive 60 giây
+  
+  Serial.println("Đang kết nối đến AWS IoT Core...");
+  
+  // Cấu hình timeout cho các thao tác mạng
+  net.setTimeout(2000); // 2 giây timeout
+  
+  String clientId = "ESP32_" + deviceMacAddress;
+  
+  reconnectCount = 0;
+  while (!client.connected() && reconnectCount < MAX_RECONNECT_ATTEMPTS) {
+    Serial.print("Lần thử #");
+    Serial.print(reconnectCount + 1);
+    Serial.print("... ");
+    
+    if (client.connect(clientId.c_str())) {
+      Serial.println("Đã kết nối!");
+      
+      // Đăng ký các topic
+      client.subscribe("$aws/things/" THINGNAME "/shadow/update/accepted");
+      client.subscribe("$aws/things/" THINGNAME "/shadow/get/accepted");
+      client.subscribe("smart_parking/command/barriers/#");
+      
+      // Lấy trạng thái shadow hiện tại
+      client.publish("$aws/things/" THINGNAME "/shadow/get", "", 0);
+      
+      // Xuất bản trạng thái ban đầu
+      publishInitialState();
+      
+      return;
+    }
+    
+    Serial.println("Thất bại.");
+    reconnectCount++;
+    delay(RECONNECT_INTERVAL);
+  }
+  
+  if (reconnectCount >= MAX_RECONNECT_ATTEMPTS) {
+    Serial.println("Đã vượt quá số lần thử kết nối. Khởi động lại ESP32...");
+    ESP.restart();
+  }
+}
+
+// ---- HÀM XỬ LÝ MQTT ----
+
+// Xử lý thông điệp MQTT nhận được
+void messageHandler(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Nhận thông điệp từ topic: ");
+  Serial.println(topic);
+  
+  // Chuyển đổi payload thành chuỗi kết thúc null
+  char payloadStr[length + 1];
+  memcpy(payloadStr, payload, length);
+  payloadStr[length] = '\0';
+  
+  Serial.print("Nội dung: ");
+  Serial.println(payloadStr);
+  
+  // Kiểm tra topic cho lệnh điều khiển rào chắn
+  if (strstr(topic, "smart_parking/command/barriers/") != NULL) {
+    DynamicJsonDocument doc(256);
+    DeserializationError error = deserializeJson(doc, payloadStr);
+    
+    if (error) {
+      Serial.print("deserializeJson() thất bại: ");
+      Serial.println(error.c_str());
+      return;
+    }
+    
+    // Xử lý lệnh điều khiển rào chắn
+    if (strstr(topic, "entry") != NULL) {
+      const char* action = doc["action"];
+      if (strcmp(action, "open") == 0) {
+        Serial.println("Lệnh mở rào vào");
+        servoEntry.write(90);
+        entryGateOpen = true;
+        publishBarrierState("entry", "opened");
+      } else if (strcmp(action, "close") == 0) {
+        Serial.println("Lệnh đóng rào vào");
+        servoEntry.write(0);
+        entryGateOpen = false;
+        publishBarrierState("entry", "closed");
+      }
+    } else if (strstr(topic, "exit") != NULL) {
+      const char* action = doc["action"];
+      if (strcmp(action, "open") == 0) {
+        Serial.println("Lệnh mở rào ra");
+        servoExit.write(0);
+        exitGateOpen = true;
+        publishBarrierState("exit", "opened");
+      } else if (strcmp(action, "close") == 0) {
+        Serial.println("Lệnh đóng rào ra");
+        servoExit.write(90);
+        exitGateOpen = false;
+        publishBarrierState("exit", "closed");
+      }
+    }
+    
+    // Cập nhật thời gian hoạt động cuối cùng
+    lastActivityTime = millis();
+  }
+  
+  // Xử lý các topic khác nếu cần
+}
+
+// Thêm thông điệp vào hàng đợi MQTT
+bool queueMqttMessage(const char* topic, const char* payload, size_t length, int qos, bool retained) {
+  if (mqttQueueIndex >= MAX_MQTT_QUEUE) {
+    Serial.println("Hàng đợi MQTT đầy, bỏ qua thông điệp");
+    return false;
+  }
+  
+  if (length > 0 && length < MAX_MQTT_PAYLOAD_SIZE) {
+    strncpy(mqttQueue[mqttQueueIndex].topic, topic, 49);
+    strncpy(mqttQueue[mqttQueueIndex].payload, payload, MAX_MQTT_PAYLOAD_SIZE - 1);
+    mqttQueue[mqttQueueIndex].length = length;
+    mqttQueue[mqttQueueIndex].qos = qos;
+    mqttQueue[mqttQueueIndex].retained = retained;
+    mqttQueue[mqttQueueIndex].pending = true;
+    mqttQueueIndex++;
+    return true;
+  }
+  
+  Serial.println("Kích thước payload không hợp lệ");
+  return false;
+}
+
+// Xuất bản thông điệp MQTT với hàng đợi
+bool publishMqttMessage(const char* topic, const JsonDocument& doc, int qos, bool retained) {
+  char buffer[MAX_MQTT_PAYLOAD_SIZE];
+  size_t n = serializeJson(doc, buffer);
+  
+  if (n > 0 && n < MAX_MQTT_PAYLOAD_SIZE) {
+    if (client.connected()) {
+      return client.publish(topic, buffer, n, retained);
+    } else {
+      return queueMqttMessage(topic, buffer, n, qos, retained);
     }
   }
-  net.setCACert(SECRET_AWS_ROOT_CA_PEM);
-  net.setCertificate(SECRET_AWS_CERT_CRT_PEM);
-  net.setPrivateKey(SECRET_AWS_PRIVATE_KEY_PEM);
-  client.setServer(SECRET_AWS_IOT_ENDPOINT, AWS_MQTT_PORT);
-  client.setCallback(messageHandler);
-  Serial.println("Đang thử kết nối AWS IoT MQTT...");
-  if (client.connect(SECRET_AWS_THING_NAME)) {
-    Serial.println("Đã kết nối AWS IoT MQTT!");
-    char entryCmdTopic[128], exitCmdTopic[128];
-    sprintf(entryCmdTopic, "parking/barrier/%s/entry/command", SECRET_AWS_THING_NAME);
-    sprintf(exitCmdTopic, "parking/barrier/%s/exit/command", SECRET_AWS_THING_NAME);
-    if(client.subscribe(entryCmdTopic)){ Serial.print("Đã subscribe tới: "); Serial.println(entryCmdTopic); } 
-    else { Serial.print("Lỗi subscribe tới: "); Serial.println(entryCmdTopic); }
-    if(client.subscribe(exitCmdTopic)){ Serial.print("Đã subscribe tới: "); Serial.println(exitCmdTopic); } 
-    else { Serial.print("Lỗi subscribe tới: "); Serial.println(exitCmdTopic); }
-  } else {
-    Serial.print("Kết nối AWS IoT MQTT thất bại, mã lỗi rc="); Serial.print(client.state());
-    char lastError[100]; net.getLastSSLError(lastError, 100);
-    Serial.print(", Lỗi WiFiClientSecure: "); Serial.println(lastError);
-    Serial.println(" Thử lại sau 5 giây...");
+  
+  Serial.println("Lỗi serialize JSON");
+  return false;
+}
+
+// Xử lý các thông điệp trong hàng đợi MQTT
+void processQueuedMessages() {
+  if (!client.connected() || mqttQueueIndex == 0) {
+    return;
+  }
+  
+  int messagesProcessed = 0;
+  for (int i = 0; i < mqttQueueIndex; i++) {
+    if (mqttQueue[i].pending) {
+      bool success = client.publish(
+        mqttQueue[i].topic, 
+        mqttQueue[i].payload, 
+        mqttQueue[i].length, 
+        mqttQueue[i].retained
+      );
+      
+      if (success) {
+        mqttQueue[i].pending = false;
+        messagesProcessed++;
+      } else {
+        Serial.print("Không thể gửi thông điệp MQTT đến topic: ");
+        Serial.println(mqttQueue[i].topic);
+        break;
+      }
+    }
+  }
+  
+  // Nếu đã xử lý tất cả thông điệp, làm trống hàng đợi
+  if (messagesProcessed == mqttQueueIndex) {
+    mqttQueueIndex = 0;
   }
 }
 
+// ---- HÀM XUẤT BẢN TRẠNG THÁI ----
 
-// --- HÀM SETUP CHÍNH ---
-void setup() {
-  Serial.begin(115200);
-  while (!Serial); 
-  delay(1000);
+// Xuất bản trạng thái rào chắn
+void publishBarrierState(const char* barrierType, const char* state) {
+  DynamicJsonDocument doc(128);
+  doc["barrier_type"] = barrierType;
+  doc["state"] = state;
+  doc["timestamp"] = getTimeStamp();
+  
+  char topic[50];
+  snprintf(topic, sizeof(topic), "smart_parking/barriers/%s/state", barrierType);
+  
+  publishMqttMessage(topic, doc);
+}
 
-  Serial.println("--- Bắt đầu chương trình điều khiển bãi đỗ xe ESP32 (Refactored) ---");
+// Xuất bản sự kiện cảm biến cổng
+void publishGateSensorEvent(const char* sensorPinIdentifier, const char* gateArea, const char* eventType) {
+  DynamicJsonDocument doc(256);
+  doc["sensor"] = sensorPinIdentifier;
+  doc["gate_area"] = gateArea;
+  doc["event"] = eventType;
+  doc["timestamp"] = getTimeStamp();
+  
+  char topic[50];
+  snprintf(topic, sizeof(topic), "smart_parking/gates/%s/events", gateArea);
+  
+  publishMqttMessage(topic, doc);
+}
 
-  // Khởi tạo pin cho cảm biến cổng
-  for (int i = 0; i < NUM_GATE_SENSORS; i++) {
-    pinMode(gateSensors[i].pin, INPUT); // << THAY ĐỔI TỪ INPUT_PULLUP SANG INPUT
-    // Đọc trạng thái ban đầu cho cảm biến cổng
-    bool initialPinState = digitalRead(gateSensors[i].pin);
-    gateSensors[i].isActive = (initialPinState == gateSensors[i].activeLogicLevel);
-    gateSensors[i].prevIsActive = gateSensors[i].isActive;
-  }
-
-  // Khởi tạo pin cho cảm biến chỗ đỗ
+// Xuất bản trạng thái chỗ đỗ
+void publishParkingSlotStatus(const char* slotMqttId, bool isOccupied) {
+  DynamicJsonDocument doc(128);
+  doc["slot_id"] = slotMqttId;
+  doc["occupied"] = isOccupied;
+  doc["timestamp"] = getTimeStamp();
+  
+  char topic[50];
+  snprintf(topic, sizeof(topic), "smart_parking/slots/%s/status", slotMqttId);
+  
+  publishMqttMessage(topic, doc);
+  
+  // Cập nhật tổng số chỗ đỗ đã sử dụng
+  totalOccupiedSlots = 0;
   for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
-    pinMode(parkingSlots[i].pin, INPUT); // << THAY ĐỔI TỪ INPUT_PULLUP SANG INPUT
-    // Đọc trạng thái ban đầu
-    bool initialPinState = digitalRead(parkingSlots[i].pin);
-    parkingSlots[i].isOccupied = (initialPinState == parkingSlots[i].activeLogicLevel);
-    parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied;
+    if (parkingSlots[i].isOccupied) {
+      totalOccupiedSlots++;
+    }
   }
-
-  // Gắn và đặt vị trí ban đầu cho servo
-  servoEntry.attach(SERVO_ENTRY_PIN);
-  servoExit.attach(SERVO_EXIT_PIN);
-  servoEntry.write(0);  // Rào vào đóng
-  servoExit.write(90); // Rào ra đóng
-  Serial.println("Đã khởi tạo Servo.");
-
-  connectWiFi();
+  
+  // Xuất bản tổng trạng thái chỗ đỗ
+  DynamicJsonDocument summaryDoc(256);
+  summaryDoc["total_slots"] = NUM_PARKING_SLOTS;
+  summaryDoc["occupied_slots"] = totalOccupiedSlots;
+  summaryDoc["available_slots"] = NUM_PARKING_SLOTS - totalOccupiedSlots;
+  summaryDoc["occupancy_percentage"] = (totalOccupiedSlots * 100) / NUM_PARKING_SLOTS;
+  summaryDoc["timestamp"] = getTimeStamp();
+  
+  publishMqttMessage("smart_parking/slots/summary", summaryDoc);
 }
 
-// --- HÀM XỬ LÝ LOGIC CẢM BIẾN CỔNG (ĐÃ REFACTOR) ---
+// Xuất bản trạng thái ban đầu
+void publishInitialState() {
+  // Xuất bản trạng thái rào chắn
+  publishBarrierState("entry", entryGateOpen ? "opened" : "closed");
+  publishBarrierState("exit", exitGateOpen ? "opened" : "closed");
+  
+  // Xuất bản trạng thái chỗ đỗ
+  for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
+    publishParkingSlotStatus(parkingSlots[i].slotMqttId, parkingSlots[i].isOccupied);
+  }
+  
+  // Xuất bản thông tin thiết bị
+  DynamicJsonDocument deviceDoc(256);
+  deviceDoc["device"]["id"] = THINGNAME;
+  deviceDoc["device"]["mac"] = deviceMacAddress;
+  deviceDoc["device"]["ip"] = WiFi.localIP().toString();
+  deviceDoc["device"]["rssi"] = WiFi.RSSI();
+  deviceDoc["device"]["uptime"] = millis() / 1000;
+  deviceDoc["device"]["firmware"] = firmwareVersion;
+  deviceDoc["device"]["startup_time"] = getTimeStamp();
+  
+  publishMqttMessage("smart_parking/device/info", deviceDoc);
+}
+
+// Báo cáo trạng thái hệ thống
+void reportSystemStatus() {
+  if (client.connected()) {
+    DynamicJsonDocument statusDoc(512);
+    
+    // Thông tin chung
+    statusDoc["device"]["id"] = THINGNAME;
+    statusDoc["device"]["mac"] = deviceMacAddress;
+    statusDoc["device"]["uptime"] = millis() / 1000;
+    statusDoc["device"]["free_heap"] = ESP.getFreeHeap();
+    statusDoc["device"]["wifi"]["rssi"] = WiFi.RSSI();
+    statusDoc["device"]["wifi"]["ip"] = WiFi.localIP().toString();
+    statusDoc["device"]["power_mode"] = lowPowerMode ? "low" : "normal";
+    statusDoc["device"]["firmware"] = firmwareVersion;
+    
+    // Thông tin chỗ đỗ
+    JsonArray slots = statusDoc.createNestedArray("parking_slots");
+    totalOccupiedSlots = 0;
+    
+    for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
+      JsonObject slot = slots.createNestedObject();
+      slot["id"] = parkingSlots[i].slotMqttId;
+      slot["occupied"] = parkingSlots[i].isOccupied;
+      if (parkingSlots[i].isOccupied) totalOccupiedSlots++;
+    }
+    
+    statusDoc["parking_summary"]["total"] = NUM_PARKING_SLOTS;
+    statusDoc["parking_summary"]["occupied"] = totalOccupiedSlots;
+    statusDoc["parking_summary"]["available"] = NUM_PARKING_SLOTS - totalOccupiedSlots;
+    statusDoc["parking_summary"]["occupancy_percentage"] = (totalOccupiedSlots * 100) / NUM_PARKING_SLOTS;
+    
+    // Thông tin rào chắn
+    statusDoc["barriers"]["entry"] = entryGateOpen ? "opened" : "closed";
+    statusDoc["barriers"]["exit"] = exitGateOpen ? "opened" : "closed";
+    
+    // Thông tin thời gian
+    statusDoc["timestamp"] = getTimeStamp();
+    
+    publishMqttMessage("smart_parking/system/status", statusDoc);
+  }
+}
+
+// ---- HÀM XỬ LÝ CẢM BIẾN ----
+
+// Xử lý cảm biến cổng
 void handleGateSensors() {
   unsigned long currentTime = millis();
+  bool activityDetected = false;
+  
   for (int i = 0; i < NUM_GATE_SENSORS; i++) {
     bool currentPinState = digitalRead(gateSensors[i].pin);
     bool currentlyDetectedActive = (currentPinState == gateSensors[i].activeLogicLevel);
 
-    if (currentlyDetectedActive != gateSensors[i].isActive) { // Nếu có sự thay đổi tiềm năng
-      if (currentTime - gateSensors[i].lastDebounceTime > GATE_SENSOR_DEBOUNCE_INTERVAL) {
-        // Trạng thái đã ổn định VÀ khác với trạng thái đã publish trước đó
-        if (currentlyDetectedActive != gateSensors[i].prevIsActive) {
-          gateSensors[i].isActive = currentlyDetectedActive; // Cập nhật trạng thái logic
+    // Phát hiện thay đổi trạng thái với debounce
+    if (currentlyDetectedActive != gateSensors[i].isActive && 
+        (currentTime - gateSensors[i].lastDebounceTime > GATE_SENSOR_DEBOUNCE_INTERVAL)) {
+      
+      gateSensors[i].isActive = currentlyDetectedActive;
+      gateSensors[i].lastDebounceTime = currentTime;
+      
+      // Nếu phát hiện hoạt động, cập nhật thời gian hoạt động cuối
+      if (gateSensors[i].isActive) {
+        activityDetected = true;
+        lastActivityTime = currentTime;
+        
+        // Xuất bản sự kiện cảm biến
+        publishGateSensorEvent(gateSensors[i].sensorIdentifier, 
+                              gateSensors[i].gateAreaMqttId, 
+                              gateSensors[i].eventTypeOnActive);
+        
+        // Xử lý rào chắn tự động nếu cần
+        if (gateSensors[i].autoCloseBarrier && gateSensors[i].associatedServo != NULL) {
+          Serial.print("Cảm biến "); Serial.print(gateSensors[i].sensorIdentifier);
+          Serial.println(" kích hoạt: Tự động đóng rào liên quan.");
           
-          if (gateSensors[i].isActive) { // Chỉ publish khi cảm biến trở nên active
-            publishGateSensorEvent(gateSensors[i].sensorIdentifier, gateSensors[i].gateAreaMqttId, gateSensors[i].eventTypeOnActive);
-            
-            // Xử lý tự động đóng rào nếu cảm biến này được cấu hình
-            if (gateSensors[i].autoCloseBarrier && gateSensors[i].associatedServo != NULL) {
-              Serial.print("Cảm biến "); Serial.print(gateSensors[i].sensorIdentifier);
-              Serial.println(" kích hoạt: Tự động đóng rào liên quan.");
-              gateSensors[i].associatedServo->write(gateSensors[i].servoClosePosition);
-              publishBarrierState(gateSensors[i].barrierTypeForState, "closed_auto");
-            }
-          } else {
-            // Tùy chọn: Publish sự kiện "cleared" khi cảm biến không còn active
-            // publishGateSensorEvent(gateSensors[i].sensorIdentifier, gateSensors[i].gateAreaMqttId, "presence_cleared");
+          gateSensors[i].associatedServo->write(gateSensors[i].servoClosePosition);
+          
+          // Cập nhật trạng thái rào chắn
+          if (strcmp(gateSensors[i].barrierTypeForState, "entry") == 0) {
+            entryGateOpen = false;
+          } else if (strcmp(gateSensors[i].barrierTypeForState, "exit") == 0) {
+            exitGateOpen = false;
           }
-          gateSensors[i].prevIsActive = gateSensors[i].isActive; // Cập nhật trạng thái đã publish
+          
+          publishBarrierState(gateSensors[i].barrierTypeForState, "closed_auto");
         }
       }
-      gateSensors[i].lastDebounceTime = currentTime; // Reset thời gian debounce cho lần đọc thay đổi này
-    } else {
-      // Nếu không có thay đổi so với isActive, nhưng trạng thái đọc được đã ổn định và trước đó nó khác prevIsActive
-      if (currentlyDetectedActive == gateSensors[i].isActive &&
-          currentlyDetectedActive != gateSensors[i].prevIsActive &&
-          (currentTime - gateSensors[i].lastDebounceTime > GATE_SENSOR_DEBOUNCE_INTERVAL)) {
-        if (gateSensors[i].isActive) { // Chỉ publish nếu trạng thái active ổn định khác với prevIsActive
-            publishGateSensorEvent(gateSensors[i].sensorIdentifier, gateSensors[i].gateAreaMqttId, gateSensors[i].eventTypeOnActive);
-             // Xử lý tự động đóng rào nếu cần (lặp lại logic ở trên nếu trạng thái active được xác nhận lại)
-            if (gateSensors[i].autoCloseBarrier && gateSensors[i].associatedServo != NULL) {
-              Serial.print("Cảm biến "); Serial.print(gateSensors[i].sensorIdentifier);
-              Serial.println(" xác nhận active: Tự động đóng rào liên quan.");
-              gateSensors[i].associatedServo->write(gateSensors[i].servoClosePosition);
-              publishBarrierState(gateSensors[i].barrierTypeForState, "closed_auto");
-            }
-        }
-        gateSensors[i].prevIsActive = gateSensors[i].isActive;
-      }
+      
+      gateSensors[i].prevIsActive = gateSensors[i].isActive;
     }
+  }
+  
+  // Nếu phát hiện hoạt động và đang ở chế độ tiết kiệm năng lượng, thoát chế độ đó
+  if (activityDetected && lowPowerMode) {
+    Serial.println("Hoạt động phát hiện: Trở lại chế độ năng lượng bình thường");
+    lowPowerMode = false;
   }
 }
 
-
-// --- HÀM XỬ LÝ LOGIC CẢM BIẾN CHỖ ĐỖ (Giữ nguyên như trước) ---
+// Xử lý cảm biến chỗ đỗ
 void handleParkingSlotSensors() {
-  unsigned long currentTime = millis();
-  for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
-    bool currentPinState = digitalRead(parkingSlots[i].pin);
-    // Xác định trạng thái occupied dựa trên activeLogicLevel đã cấu hình
-    bool currentlyDetectedOccupied = (currentPinState == parkingSlots[i].activeLogicLevel); 
+ unsigned long currentTime = millis();
+ bool slotStateChanged = false;
+ 
+ for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
+   bool currentPinState = digitalRead(parkingSlots[i].pin);
+   bool currentlyDetectedOccupied = (currentPinState == parkingSlots[i].activeLogicLevel);
 
-    if (currentlyDetectedOccupied != parkingSlots[i].isOccupied) { 
-      if (currentTime - parkingSlots[i].lastDebounceTime > SLOT_DEBOUNCE_DELAY) {
-        if (currentlyDetectedOccupied != parkingSlots[i].prevIsOccupied) { 
-          parkingSlots[i].isOccupied = currentlyDetectedOccupied; 
-          publishParkingSlotStatus(parkingSlots[i].slotMqttId, parkingSlots[i].isOccupied);
-          parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied; 
-        }
-      }
-      parkingSlots[i].lastDebounceTime = currentTime; 
-    } else {
-      if (currentlyDetectedOccupied == parkingSlots[i].isOccupied && 
-          currentlyDetectedOccupied != parkingSlots[i].prevIsOccupied && 
-          (currentTime - parkingSlots[i].lastDebounceTime > SLOT_DEBOUNCE_DELAY)) {
-        publishParkingSlotStatus(parkingSlots[i].slotMqttId, parkingSlots[i].isOccupied);
-        parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied;
-      }
-    }
-  }
+   // Phát hiện thay đổi trạng thái với debounce
+   if (currentlyDetectedOccupied != parkingSlots[i].isOccupied && 
+       (currentTime - parkingSlots[i].lastDebounceTime > SLOT_DEBOUNCE_DELAY)) {
+     
+     parkingSlots[i].isOccupied = currentlyDetectedOccupied;
+     parkingSlots[i].lastDebounceTime = currentTime;
+     
+     // Xuất bản trạng thái mới
+     publishParkingSlotStatus(parkingSlots[i].slotMqttId, parkingSlots[i].isOccupied);
+     parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied;
+     
+     slotStateChanged = true;
+     lastActivityTime = currentTime; // Cập nhật thời gian hoạt động cuối
+   }
+ }
+ 
+ // Nếu có thay đổi trạng thái, lưu trạng thái mới
+ if (slotStateChanged) {
+   saveState();
+ }
 }
 
-// --- HÀM LOOP CHÍNH ---
+// ---- HÀM LƯU TRỮ TRẠNG THÁI ----
+
+// Lưu trạng thái vào bộ nhớ không bay hơi
+void saveState() {
+ // Lưu trạng thái của các chỗ đỗ
+ for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
+   String key = "slot" + String(i);
+   preferences.putBool(key.c_str(), parkingSlots[i].isOccupied);
+ }
+ 
+ // Lưu trạng thái rào chắn
+ preferences.putBool("entry_open", entryGateOpen);
+ preferences.putBool("exit_open", exitGateOpen);
+ 
+ // Lưu thời gian
+ preferences.putULong("lastSave", millis());
+ 
+ Serial.println("Đã lưu trạng thái hệ thống");
+}
+
+// Khôi phục trạng thái từ bộ nhớ không bay hơi
+void restoreState() {
+ // Kiểm tra xem có trạng thái đã lưu không
+ unsigned long lastSave = preferences.getULong("lastSave", 0);
+ if (lastSave > 0) {
+   Serial.println("Đang khôi phục trạng thái trước đó...");
+   
+   // Khôi phục trạng thái chỗ đỗ
+   totalOccupiedSlots = 0;
+   for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
+     String key = "slot" + String(i);
+     parkingSlots[i].isOccupied = preferences.getBool(key.c_str(), false);
+     parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied;
+     
+     if (parkingSlots[i].isOccupied) {
+       totalOccupiedSlots++;
+     }
+   }
+   
+   // Khôi phục trạng thái rào chắn
+   entryGateOpen = preferences.getBool("entry_open", false);
+   exitGateOpen = preferences.getBool("exit_open", false);
+   
+   Serial.println("Đã khôi phục trạng thái hệ thống");
+ } else {
+   Serial.println("Không tìm thấy trạng thái đã lưu trước đó");
+ }
+}
+
+// ======= CÁC HÀM CHÍNH ========
+
+// Hàm setup
+void setup() {
+ // Khởi tạo giao tiếp Serial
+ Serial.begin(115200);
+ while (!Serial && millis() < 5000); // Đợi tối đa 5 giây cho serial, rồi tiếp tục
+ delay(1000);
+
+ // Lưu thời gian khởi động
+ systemStartTime = millis();
+
+ Serial.println("\n\n--- ĐÃ KHỞI ĐỘNG HỆ THỐNG QUẢN LÝ BÃI ĐỖ XE ---");
+ Serial.print("Phiên bản firmware: ");
+ Serial.println(firmwareVersion);
+ Serial.println("Ngày: " + getTimeStamp());
+
+ // Khởi tạo watchdog
+ esp_task_wdt_init(WDT_TIMEOUT, true);
+ esp_task_wdt_add(NULL);
+ Serial.println("Đã khởi tạo Watchdog Timer");
+ 
+ // Khởi tạo Preferences cho lưu trữ
+ preferences.begin("parking", false);
+ Serial.println("Đã khởi tạo bộ nhớ không bay hơi");
+ 
+ // Khôi phục trạng thái trước đó nếu có
+ restoreState();
+
+ Serial.println("Đang khởi tạo cảm biến và rào chắn...");
+ 
+ // Khởi tạo pin cho cảm biến cổng
+ for (int i = 0; i < NUM_GATE_SENSORS; i++) {
+   pinMode(gateSensors[i].pin, INPUT);
+   bool initialPinState = digitalRead(gateSensors[i].pin);
+   gateSensors[i].isActive = (initialPinState == gateSensors[i].activeLogicLevel);
+   gateSensors[i].prevIsActive = gateSensors[i].isActive;
+   
+   Serial.print("Cảm biến ");
+   Serial.print(gateSensors[i].sensorIdentifier);
+   Serial.print(": trạng thái ban đầu = ");
+   Serial.println(gateSensors[i].isActive ? "ACTIVE" : "INACTIVE");
+ }
+
+ // Khởi tạo pin cho cảm biến chỗ đỗ
+ for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
+   pinMode(parkingSlots[i].pin, INPUT);
+   bool initialPinState = digitalRead(parkingSlots[i].pin);
+   parkingSlots[i].isOccupied = (initialPinState == parkingSlots[i].activeLogicLevel);
+   parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied;
+   
+   Serial.print("Chỗ đỗ ");
+   Serial.print(parkingSlots[i].slotMqttId);
+   Serial.print(": trạng thái ban đầu = ");
+   Serial.println(parkingSlots[i].isOccupied ? "OCCUPIED" : "AVAILABLE");
+ }
+
+ // Gắn và đặt vị trí ban đầu cho servo
+ servoEntry.attach(SERVO_ENTRY_PIN);
+ servoExit.attach(SERVO_EXIT_PIN);
+ 
+ // Đặt vị trí servo dựa trên trạng thái đã khôi phục
+ if (entryGateOpen) {
+   servoEntry.write(90);
+ } else {
+   servoEntry.write(0);
+ }
+ 
+ if (exitGateOpen) {
+   servoExit.write(0);
+ } else {
+   servoExit.write(90);
+ }
+ 
+ Serial.print("Rào vào: ");
+ Serial.println(entryGateOpen ? "MỞ" : "ĐÓNG");
+ Serial.print("Rào ra: ");
+ Serial.println(exitGateOpen ? "MỞ" : "ĐÓNG");
+
+ // Khởi tạo biến hoạt động
+ lastActivityTime = millis();
+ 
+ // Kết nối WiFi và AWS IoT
+ connectWiFi();
+ connectAWSIoT();
+ 
+ Serial.println("--- Khởi động hoàn tất ---");
+}
+
+// Hàm loop
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi bị ngắt kết nối. Đang kết nối lại...");
-    connectWiFi();
-  }
-  
-  if (!client.connected()) {
-    connectAWSIoT(); 
-    delay(5000);     
-    return;          
-  }
-
-  client.loop(); 
-
-  // Xử lý logic cho các cảm biến cổng (đã refactor)
-  handleGateSensors();
-
-  // Xử lý logic cho 4 cảm biến chỗ đỗ
-  handleParkingSlotSensors();
-  
-  // delay(10); // Một delay nhỏ có thể hữu ích để ổn định, nhưng client.loop() nên được gọi thường xuyên
+ unsigned long currentTime = millis();
+ 
+ // Đặt lại watchdog
+ esp_task_wdt_reset();
+ 
+ // Kiểm tra kết nối WiFi và MQTT
+ if (WiFi.status() != WL_CONNECTED) {
+   Serial.println("WiFi bị ngắt kết nối. Đang kết nối lại...");
+   connectWiFi();
+ }
+ 
+ if (!client.connected()) {
+   // Thử kết nối lại nếu đã đến lúc
+   if (currentTime - lastReconnectAttempt > RECONNECT_INTERVAL) {
+     lastReconnectAttempt = currentTime;
+     if (reconnectAWSIoT()) {
+       Serial.println("Đã kết nối lại thành công đến AWS IoT!");
+       lastReconnectAttempt = 0;
+     } else {
+       reconnectCount++;
+       if (reconnectCount > MAX_RECONNECT_ATTEMPTS) {
+         Serial.println("Quá nhiều lần thử kết nối thất bại. Đang khởi động lại...");
+         ESP.restart();
+       }
+     }
+   }
+ } else {
+   client.loop();
+   processQueuedMessages(); // Xử lý các thông điệp trong hàng đợi
+   reconnectCount = 0; // Đặt lại bộ đếm khi kết nối thành công
+ }
+ 
+ // Quản lý chế độ năng lượng dựa trên hoạt động
+ if (!lowPowerMode && (currentTime - lastActivityTime > ACTIVITY_TIMEOUT)) {
+   Serial.println("Không có hoạt động trong thời gian dài: Chuyển sang chế độ tiết kiệm năng lượng");
+   lowPowerMode = true;
+ }
+ 
+ // Xử lý cảm biến 
+ handleGateSensors();
+ handleParkingSlotSensors();
+ 
+ // Nếu ở chế độ tiết kiệm năng lượng, giảm tần số quét cảm biến
+ if (lowPowerMode) {
+   delay(500); // Thêm độ trễ để giảm tần số quét
+ }
+ 
+ // Báo cáo trạng thái định kỳ
+ if (currentTime - lastStatusReport > STATUS_REPORT_INTERVAL) {
+   lastStatusReport = currentTime;
+   reportSystemStatus();
+ }
+ 
+ // Đồng bộ thời gian NTP định kỳ (mỗi 24 giờ)
+ static unsigned long lastNTPSync = 0;
+ if (currentTime - lastNTPSync > 86400000) { // 24 giờ
+   lastNTPSync = currentTime;
+   syncNTPTime();
+ }
+ 
+ // Lưu trạng thái định kỳ
+ if (currentTime - lastStateSave > STATE_SAVE_INTERVAL) {
+   lastStateSave = currentTime;
+   saveState();
+ }
 }
