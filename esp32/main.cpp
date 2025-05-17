@@ -11,7 +11,7 @@
 // Cảm biến cổng
 #define SENSOR_VAO_1_PIN 26
 #define SENSOR_VAO_2_PIN 34 
-#define SENSOR_RA_1_PIN  14
+#define SENSOR_RA_1_PIN  13
 #define SENSOR_RA_2_PIN  23 
 
 // Servo điều khiển rào chắn
@@ -71,13 +71,14 @@ struct ParkingSlotSensor {
   bool isOccupied;
   bool prevIsOccupied;
   unsigned long lastDebounceTime;
+  const int activeLogicLevel;
 };
 
 ParkingSlotSensor parkingSlots[] = {
-  {SLOT_SENSOR_PIN_1, "S1", false, false, 0},
-  {SLOT_SENSOR_PIN_2, "S2", false, false, 0},
-  // {SLOT_SENSOR_PIN_3, "S3", false, false, 0},
-  // {SLOT_SENSOR_PIN_4, "S4", false, false, 0}
+  {SLOT_SENSOR_PIN_1, "S1", false, false, 0, HIGH}, // Giả sử active HIGH = occupied
+  {SLOT_SENSOR_PIN_2, "S2", false, false, 0, HIGH},
+//   {SLOT_SENSOR_PIN_3, "S3", false, false, 0, HIGH},
+//   {SLOT_SENSOR_PIN_4, "S4", false, false, 0, HIGH}
 };
 const int NUM_PARKING_SLOTS = 2;
 const unsigned long SLOT_DEBOUNCE_DELAY = 1000;
@@ -256,17 +257,19 @@ void setup() {
 
   // Khởi tạo pin cho cảm biến cổng
   for (int i = 0; i < NUM_GATE_SENSORS; i++) {
-    pinMode(gateSensors[i].pin, INPUT_PULLUP); // Giả định tất cả dùng PULLUP ban đầu
+    pinMode(gateSensors[i].pin, INPUT); // << THAY ĐỔI TỪ INPUT_PULLUP SANG INPUT
     // Đọc trạng thái ban đầu cho cảm biến cổng
     bool initialPinState = digitalRead(gateSensors[i].pin);
     gateSensors[i].isActive = (initialPinState == gateSensors[i].activeLogicLevel);
     gateSensors[i].prevIsActive = gateSensors[i].isActive;
   }
 
-  // Khởi tạo pin cho cảm biến chỗ đỗ (giữ nguyên)
+  // Khởi tạo pin cho cảm biến chỗ đỗ
   for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
-    pinMode(parkingSlots[i].pin, INPUT_PULLUP); 
-    parkingSlots[i].isOccupied = (digitalRead(parkingSlots[i].pin) == LOW); // Giả định LOW = occupied
+    pinMode(parkingSlots[i].pin, INPUT); // << THAY ĐỔI TỪ INPUT_PULLUP SANG INPUT
+    // Đọc trạng thái ban đầu
+    bool initialPinState = digitalRead(parkingSlots[i].pin);
+    parkingSlots[i].isOccupied = (initialPinState == parkingSlots[i].activeLogicLevel);
     parkingSlots[i].prevIsOccupied = parkingSlots[i].isOccupied;
   }
 
@@ -337,8 +340,9 @@ void handleGateSensors() {
 void handleParkingSlotSensors() {
   unsigned long currentTime = millis();
   for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
-    bool currentPinStateIsLow = (digitalRead(parkingSlots[i].pin) == LOW); 
-    bool currentlyDetectedOccupied = currentPinStateIsLow; 
+    bool currentPinState = digitalRead(parkingSlots[i].pin);
+    // Xác định trạng thái occupied dựa trên activeLogicLevel đã cấu hình
+    bool currentlyDetectedOccupied = (currentPinState == parkingSlots[i].activeLogicLevel); 
 
     if (currentlyDetectedOccupied != parkingSlots[i].isOccupied) { 
       if (currentTime - parkingSlots[i].lastDebounceTime > SLOT_DEBOUNCE_DELAY) {
