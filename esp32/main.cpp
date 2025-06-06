@@ -10,20 +10,19 @@
 
 // ======= ĐỊNH NGHĨA PIN CHO CẢM BIẾN VÀ SERVO ========
 // Cảm biến cổng
-#define SENSOR_VAO_1_PIN 26
-#define SENSOR_VAO_2_PIN 34
-#define SENSOR_RA_1_PIN  13
-#define SENSOR_RA_2_PIN  23
+#define SENSOR_VAO_1_PIN 13
+#define SENSOR_VAO_2_PIN 26
+#define SENSOR_RA_1_PIN  34
+#define SENSOR_RA_2_PIN  35
 
 // Servo điều khiển rào chắn
-#define SERVO_ENTRY_PIN 19
-#define SERVO_EXIT_PIN  18
+#define SERVO_ENTRY_PIN 18
+#define SERVO_EXIT_PIN  19
 
 // Cảm biến chỗ đỗ (4 cảm biến IR)
-#define SLOT_SENSOR_PIN_1 32
-#define SLOT_SENSOR_PIN_2 33
-#define SLOT_SENSOR_PIN_3 25
-#define SLOT_SENSOR_PIN_4 27
+#define SLOT_SENSOR_PIN_1 23
+#define SLOT_SENSOR_PIN_2 4
+#define SLOT_SENSOR_PIN_3 16
 
 // ======= HẰNG SỐ VÀ CẤU HÌNH ========
 // Cấu hình Watchdog
@@ -97,20 +96,20 @@ struct MQTTMessage {
 // Cảm biến cổng với activeLogicLevel phù hợp
 GateSensor gateSensors[] = {
   // {pin, identifier, gateArea, eventType, isActive, prevIsActive, lastDebounce, activeLogic, autoClose, servo, servoPos, barrierType}
-  {SENSOR_VAO_1_PIN, "SENSOR_VAO_1", "entry_approach", "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
-  {SENSOR_VAO_2_PIN, "SENSOR_VAO_2", "entry_passed",   "vehicle_passed",    false, false, 0, HIGH, true, &servoEntry, 0, "entry"},
-  {SENSOR_RA_1_PIN,  "SENSOR_RA_1",  "exit_approach",  "presence_detected", false, false, 0, HIGH, false, NULL, 0, ""},
-  {SENSOR_RA_2_PIN,  "SENSOR_RA_2",  "exit_passed",    "vehicle_passed",    false, false, 0, LOW,  true, &servoExit, 90, "exit"}
+  {SENSOR_VAO_1_PIN, "SENSOR_VAO_1", "entry_approach", "presence_detected", false, false, 0, LOW, false, NULL, 0, ""},
+  {SENSOR_VAO_2_PIN, "SENSOR_VAO_2", "entry_passed",   "vehicle_passed",    false, false, 0, LOW, true, &servoEntry, 90, "entry"},
+  {SENSOR_RA_1_PIN,  "SENSOR_RA_1",  "exit_approach",  "presence_detected", false, false, 0, LOW, false, NULL, 0, ""},
+  {SENSOR_RA_2_PIN,  "SENSOR_RA_2",  "exit_passed",    "vehicle_passed",    false, false, 0, HIGH,  true, &servoExit, 90, "exit"}
 };
 const int NUM_GATE_SENSORS = sizeof(gateSensors) / sizeof(GateSensor);
 
 // Cảm biến chỗ đỗ
 ParkingSlotSensor parkingSlots[] = {
   // {pin, slotId, isOccupied, prevIsOccupied, lastDebounce, activeLogic}
-  {SLOT_SENSOR_PIN_1, "S1", false, false, 0, HIGH},
-  {SLOT_SENSOR_PIN_2, "S2", false, false, 0, HIGH},
-  {SLOT_SENSOR_PIN_3, "S3", false, false, 0, HIGH},
-  {SLOT_SENSOR_PIN_4, "S4", false, false, 0, HIGH}
+  {SLOT_SENSOR_PIN_1, "S1", false, false, 0, LOW},
+  {SLOT_SENSOR_PIN_2, "S2", false, false, 0, LOW},
+  {SLOT_SENSOR_PIN_3, "S3", false, false, 0, LOW},
+  //{SLOT_SENSOR_PIN_4, "S4", false, false, 0, LOW}
 };
 const int NUM_PARKING_SLOTS = sizeof(parkingSlots) / sizeof(ParkingSlotSensor);
 
@@ -242,27 +241,12 @@ String getTimeStamp() {
 boolean reconnectAWSIoT() {
   Serial.println("Đang thử kết nối lại đến AWS IoT Core...");
   
-  String clientId = "ESP32_" + deviceMacAddress;
-  
-  if (client.connect(clientId.c_str())) {
+  if (client.connect(THINGNAME)) {
     Serial.println("Đã kết nối lại thành công đến AWS IoT!");
     reconnectCount = 0;
     
-    // Đăng ký lại các topic cần thiết
-    client.subscribe("$aws/things/" THINGNAME "/shadow/update/accepted");
-    client.subscribe("$aws/things/" THINGNAME "/shadow/get/accepted");
+    // Đăng ký các topic cần thiết
     client.subscribe("smart_parking/command/barriers/#");
-    
-    // Báo cáo trạng thái kết nối
-    DynamicJsonDocument statusDoc(256);
-    statusDoc["state"]["reported"]["connection"] = "online";
-    statusDoc["state"]["reported"]["last_reconnect"] = getTimeStamp();
-    statusDoc["state"]["reported"]["ip"] = WiFi.localIP().toString();
-    statusDoc["state"]["reported"]["rssi"] = WiFi.RSSI();
-    
-    char buffer[256];
-    size_t n = serializeJson(statusDoc, buffer);
-    client.publish("$aws/things/" THINGNAME "/shadow/update", buffer, n);
     
     return true;
   }
@@ -287,24 +271,17 @@ void connectAWSIoT() {
   // Cấu hình timeout cho các thao tác mạng
   net.setTimeout(2000); // 2 giây timeout
   
-  String clientId = "ESP32_" + deviceMacAddress;
-  
   reconnectCount = 0;
   while (!client.connected() && reconnectCount < MAX_RECONNECT_ATTEMPTS) {
     Serial.print("Lần thử #");
     Serial.print(reconnectCount + 1);
     Serial.print("... ");
     
-    if (client.connect(clientId.c_str())) {
+    if (client.connect(THINGNAME)) {
       Serial.println("Đã kết nối!");
       
       // Đăng ký các topic
-      client.subscribe("$aws/things/" THINGNAME "/shadow/update/accepted");
-      client.subscribe("$aws/things/" THINGNAME "/shadow/get/accepted");
       client.subscribe("smart_parking/command/barriers/#");
-      
-      // Lấy trạng thái shadow hiện tại
-      client.publish("$aws/things/" THINGNAME "/shadow/get", "", 0);
       
       // Xuất bản trạng thái ban đầu
       publishInitialState();
@@ -338,7 +315,7 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
   Serial.print("Nội dung: ");
   Serial.println(payloadStr);
   
-  // Kiểm tra topic cho lệnh điều khiển rào chắn
+  // Xử lý thông điệp lệnh điều khiển rào chắn
   if (strstr(topic, "smart_parking/command/barriers/") != NULL) {
     DynamicJsonDocument doc(256);
     DeserializationError error = deserializeJson(doc, payloadStr);
@@ -351,20 +328,20 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
     
     // Xử lý lệnh điều khiển rào chắn
     if (strstr(topic, "entry") != NULL) {
-      const char* action = doc["action"];
+      const char* action = doc["command"];
       if (strcmp(action, "open") == 0) {
         Serial.println("Lệnh mở rào vào");
-        servoEntry.write(90);
+        servoEntry.write(0);
         entryGateOpen = true;
         publishBarrierState("entry", "opened");
       } else if (strcmp(action, "close") == 0) {
         Serial.println("Lệnh đóng rào vào");
-        servoEntry.write(0);
+        servoEntry.write(90);
         entryGateOpen = false;
         publishBarrierState("entry", "closed");
       }
     } else if (strstr(topic, "exit") != NULL) {
-      const char* action = doc["action"];
+      const char* action = doc["command"];
       if (strcmp(action, "open") == 0) {
         Serial.println("Lệnh mở rào ra");
         servoExit.write(0);
@@ -380,9 +357,10 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
     
     // Cập nhật thời gian hoạt động cuối cùng
     lastActivityTime = millis();
+    
+    // Lưu trạng thái mới
+    saveState();
   }
-  
-  // Xử lý các topic khác nếu cần
 }
 
 // Thêm thông điệp vào hàng đợi MQTT
@@ -400,6 +378,7 @@ bool queueMqttMessage(const char* topic, const char* payload, size_t length, int
     mqttQueue[mqttQueueIndex].retained = retained;
     mqttQueue[mqttQueueIndex].pending = true;
     mqttQueueIndex++;
+    Serial.print("Message đã được queue");
     return true;
   }
   
@@ -414,7 +393,7 @@ bool publishMqttMessage(const char* topic, const JsonDocument& doc, int qos, boo
   
   if (n > 0 && n < MAX_MQTT_PAYLOAD_SIZE) {
     if (client.connected()) {
-      return client.publish(topic, buffer, n, retained);
+      return client.publish(topic, (const uint8_t*)buffer, n, retained);
     } else {
       return queueMqttMessage(topic, buffer, n, qos, retained);
     }
@@ -435,7 +414,7 @@ void processQueuedMessages() {
     if (mqttQueue[i].pending) {
       bool success = client.publish(
         mqttQueue[i].topic, 
-        mqttQueue[i].payload, 
+        (const uint8_t*)mqttQueue[i].payload, 
         mqttQueue[i].length, 
         mqttQueue[i].retained
       );
@@ -461,10 +440,16 @@ void processQueuedMessages() {
 
 // Xuất bản trạng thái rào chắn
 void publishBarrierState(const char* barrierType, const char* state) {
-  DynamicJsonDocument doc(128);
+  DynamicJsonDocument doc(256);
+  
+  // Thêm metadata tiêu chuẩn
+  doc["device_id"] = THINGNAME;
+  doc["message_type"] = "barrier_state";
+  
+  // Dữ liệu chính - flat format để dễ truy vấn
   doc["barrier_type"] = barrierType;
-  doc["state"] = state;
-  doc["timestamp"] = getTimeStamp();
+  doc["barrier_state"] = state;
+  doc["barrier_id"] = String(THINGNAME) + "_" + String(barrierType);
   
   char topic[50];
   snprintf(topic, sizeof(topic), "smart_parking/barriers/%s/state", barrierType);
@@ -475,10 +460,15 @@ void publishBarrierState(const char* barrierType, const char* state) {
 // Xuất bản sự kiện cảm biến cổng
 void publishGateSensorEvent(const char* sensorPinIdentifier, const char* gateArea, const char* eventType) {
   DynamicJsonDocument doc(256);
-  doc["sensor"] = sensorPinIdentifier;
+  
+  // Thêm metadata tiêu chuẩn
+  doc["device_id"] = THINGNAME;
+  doc["message_type"] = "gate_event";
+  
+  // Dữ liệu sự kiện - flat format
+  doc["sensor_id"] = sensorPinIdentifier;
   doc["gate_area"] = gateArea;
-  doc["event"] = eventType;
-  doc["timestamp"] = getTimeStamp();
+  doc["event_type"] = eventType;
   
   char topic[50];
   snprintf(topic, sizeof(topic), "smart_parking/gates/%s/events", gateArea);
@@ -488,33 +478,17 @@ void publishGateSensorEvent(const char* sensorPinIdentifier, const char* gateAre
 
 // Xuất bản trạng thái chỗ đỗ
 void publishParkingSlotStatus(const char* slotMqttId, bool isOccupied) {
-  DynamicJsonDocument doc(128);
+  DynamicJsonDocument doc(256);
+  doc["device_id"] = THINGNAME;
   doc["slot_id"] = slotMqttId;
   doc["occupied"] = isOccupied;
   doc["timestamp"] = getTimeStamp();
+  doc["message_type"] = "slot_status";
   
   char topic[50];
   snprintf(topic, sizeof(topic), "smart_parking/slots/%s/status", slotMqttId);
   
   publishMqttMessage(topic, doc);
-  
-  // Cập nhật tổng số chỗ đỗ đã sử dụng
-  totalOccupiedSlots = 0;
-  for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
-    if (parkingSlots[i].isOccupied) {
-      totalOccupiedSlots++;
-    }
-  }
-  
-  // Xuất bản tổng trạng thái chỗ đỗ
-  DynamicJsonDocument summaryDoc(256);
-  summaryDoc["total_slots"] = NUM_PARKING_SLOTS;
-  summaryDoc["occupied_slots"] = totalOccupiedSlots;
-  summaryDoc["available_slots"] = NUM_PARKING_SLOTS - totalOccupiedSlots;
-  summaryDoc["occupancy_percentage"] = (totalOccupiedSlots * 100) / NUM_PARKING_SLOTS;
-  summaryDoc["timestamp"] = getTimeStamp();
-  
-  publishMqttMessage("smart_parking/slots/summary", summaryDoc);
 }
 
 // Xuất bản trạng thái ban đầu
@@ -530,13 +504,12 @@ void publishInitialState() {
   
   // Xuất bản thông tin thiết bị
   DynamicJsonDocument deviceDoc(256);
-  deviceDoc["device"]["id"] = THINGNAME;
-  deviceDoc["device"]["mac"] = deviceMacAddress;
-  deviceDoc["device"]["ip"] = WiFi.localIP().toString();
-  deviceDoc["device"]["rssi"] = WiFi.RSSI();
-  deviceDoc["device"]["uptime"] = millis() / 1000;
-  deviceDoc["device"]["firmware"] = firmwareVersion;
-  deviceDoc["device"]["startup_time"] = getTimeStamp();
+  deviceDoc["message_type"] = "startup";
+  deviceDoc["device_id"] = THINGNAME;
+  deviceDoc["wifi"]["mac"] = deviceMacAddress;
+  deviceDoc["wifi"]["ip"] = WiFi.localIP().toString();
+  deviceDoc["wifi"]["rssi"] = WiFi.RSSI();
+  deviceDoc["firmware_version"] = firmwareVersion;
   
   publishMqttMessage("smart_parking/device/info", deviceDoc);
 }
@@ -546,38 +519,20 @@ void reportSystemStatus() {
   if (client.connected()) {
     DynamicJsonDocument statusDoc(512);
     
-    // Thông tin chung
-    statusDoc["device"]["id"] = THINGNAME;
-    statusDoc["device"]["mac"] = deviceMacAddress;
-    statusDoc["device"]["uptime"] = millis() / 1000;
-    statusDoc["device"]["free_heap"] = ESP.getFreeHeap();
-    statusDoc["device"]["wifi"]["rssi"] = WiFi.RSSI();
-    statusDoc["device"]["wifi"]["ip"] = WiFi.localIP().toString();
-    statusDoc["device"]["power_mode"] = lowPowerMode ? "low" : "normal";
-    statusDoc["device"]["firmware"] = firmwareVersion;
-    
-    // Thông tin chỗ đỗ
-    JsonArray slots = statusDoc.createNestedArray("parking_slots");
-    totalOccupiedSlots = 0;
-    
-    for (int i = 0; i < NUM_PARKING_SLOTS; i++) {
-      JsonObject slot = slots.createNestedObject();
-      slot["id"] = parkingSlots[i].slotMqttId;
-      slot["occupied"] = parkingSlots[i].isOccupied;
-      if (parkingSlots[i].isOccupied) totalOccupiedSlots++;
-    }
-    
-    statusDoc["parking_summary"]["total"] = NUM_PARKING_SLOTS;
-    statusDoc["parking_summary"]["occupied"] = totalOccupiedSlots;
-    statusDoc["parking_summary"]["available"] = NUM_PARKING_SLOTS - totalOccupiedSlots;
-    statusDoc["parking_summary"]["occupancy_percentage"] = (totalOccupiedSlots * 100) / NUM_PARKING_SLOTS;
-    
-    // Thông tin rào chắn
-    statusDoc["barriers"]["entry"] = entryGateOpen ? "opened" : "closed";
-    statusDoc["barriers"]["exit"] = exitGateOpen ? "opened" : "closed";
-    
-    // Thông tin thời gian
     statusDoc["timestamp"] = getTimeStamp();
+    statusDoc["device_id"] = THINGNAME;
+    statusDoc["device_type"] = "parking_controller";
+    statusDoc["message_type"] = "system_status";
+    
+    // Device info - flat format
+    statusDoc["firmware_version"] = firmwareVersion;
+    
+    // Connection info
+    statusDoc["wifi"]["ssid"] = WiFi.SSID();
+    statusDoc["wifi"]["rssi"] = WiFi.RSSI();
+    statusDoc["wifi"]["ip"] = WiFi.localIP().toString();
+    statusDoc["wifi"]["mac"] = deviceMacAddress;
+    
     
     publishMqttMessage("smart_parking/system/status", statusDoc);
   }
@@ -626,6 +581,9 @@ void handleGateSensors() {
           }
           
           publishBarrierState(gateSensors[i].barrierTypeForState, "closed_auto");
+          
+          // Lưu trạng thái mới
+          saveState();
         }
       }
       
@@ -685,10 +643,13 @@ void saveState() {
  preferences.putBool("entry_open", entryGateOpen);
  preferences.putBool("exit_open", exitGateOpen);
  
+ // Lưu thông tin chế độ năng lượng
+ preferences.putBool("low_power", lowPowerMode);
+ 
  // Lưu thời gian
  preferences.putULong("lastSave", millis());
  
- Serial.println("Đã lưu trạng thái hệ thống");
+ Serial.println("Đã lưu trạng thái hệ thống vào bộ nhớ local");
 }
 
 // Khôi phục trạng thái từ bộ nhớ không bay hơi
@@ -714,11 +675,31 @@ void restoreState() {
    entryGateOpen = preferences.getBool("entry_open", false);
    exitGateOpen = preferences.getBool("exit_open", false);
    
-   Serial.println("Đã khôi phục trạng thái hệ thống");
+   // Khôi phục thông tin chế độ năng lượng
+   lowPowerMode = preferences.getBool("low_power", false);
+   
+   Serial.println("Đã khôi phục trạng thái hệ thống từ bộ nhớ local");
  } else {
    Serial.println("Không tìm thấy trạng thái đã lưu trước đó");
  }
 }
+
+void setupWatchdog() {
+  #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    // Cho ESP-IDF 5.x trở lên
+    esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = WDT_TIMEOUT * 1000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_config);
+  #else
+    // Cho ESP-IDF phiên bản cũ
+    esp_task_wdt_init(WDT_TIMEOUT, true);
+  #endif
+  esp_task_wdt_add(NULL);
+}
+
 
 // ======= CÁC HÀM CHÍNH ========
 
@@ -738,9 +719,8 @@ void setup() {
  Serial.println("Ngày: " + getTimeStamp());
 
  // Khởi tạo watchdog
- esp_task_wdt_init(WDT_TIMEOUT, true);
- esp_task_wdt_add(NULL);
- Serial.println("Đã khởi tạo Watchdog Timer");
+  // Serial.println("Đang khởi tạo Watchdog Timer...");
+  // setupWatchdog();
  
  // Khởi tạo Preferences cho lưu trữ
  preferences.begin("parking", false);
@@ -814,7 +794,7 @@ void loop() {
  unsigned long currentTime = millis();
  
  // Đặt lại watchdog
- esp_task_wdt_reset();
+ // esp_task_wdt_reset();
  
  // Kiểm tra kết nối WiFi và MQTT
  if (WiFi.status() != WL_CONNECTED) {
@@ -847,6 +827,7 @@ void loop() {
  if (!lowPowerMode && (currentTime - lastActivityTime > ACTIVITY_TIMEOUT)) {
    Serial.println("Không có hoạt động trong thời gian dài: Chuyển sang chế độ tiết kiệm năng lượng");
    lowPowerMode = true;
+   saveState(); // Lưu trạng thái chế độ năng lượng
  }
  
  // Xử lý cảm biến 
